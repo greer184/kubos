@@ -107,6 +107,7 @@ wrap(function ()
     for dest in expose:gmatch("%d+") do
       dest = tonumber(dest)
       local server = uv.new_udp()
+      handles[dest] = server
       assert(server:bind(host, dest))
       assert(server:recv_start(make_sender(dest)))
       print 'Communications service forwarding UDP:'
