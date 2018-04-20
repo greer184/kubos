@@ -61,21 +61,31 @@ local read, write
 
 local handles = {}
 
-local function make_receiver(dest)
+local function make_receiver(dest, handle)
+  local pressure = 0
   return wrap(function (err, data, addr)
     if err then return print(err) end
     if not data then return end
     local source = addr.port
     p('udp-res -> ' .. transport_name, {source=source, dest=dest, len=#data})
+    pressure = pressure + 1
+    if pressure > 1 then
+      handle:send('\x01', addr.ip, addr.port)
+    end
     write {
       source = source,
       dest = dest,
       data = data
     }
+    pressure = pressure - 1
+    if pressure == 0 then
+      handle:send('\x02', addr.ip, addr.port)
+    end
   end)
 end
 
-local function make_sender(dest)
+local function make_sender(dest, handle)
+  local pressure = 0
   return wrap(function (err, data, addr)
     assert(not err, err)
     if not data then return end
@@ -85,11 +95,19 @@ local function make_sender(dest)
       dest = dest,
       len = #data
     })
+    pressure = pressure + 1
+    if pressure > 1 then
+      handle:send('\x01', addr.ip, addr.port)
+    end
     write {
       source = source,
       dest = dest,
       data = data,
     }
+    pressure = pressure - 1
+    if pressure <= 1 then
+      handle:send('\x02', addr.ip, addr.port)
+    end
   end)
 end
 
@@ -109,7 +127,7 @@ wrap(function ()
       local server = uv.new_udp()
       handles[dest] = server
       assert(server:bind(host, dest))
-      assert(server:recv_start(make_sender(dest)))
+      assert(server:recv_start(make_sender(dest, server)))
       print 'Communications service forwarding UDP:'
       p("repeater", server:getsockname())
     end
@@ -125,7 +143,7 @@ wrap(function ()
     if not handle then
       handle = uv.new_udp()
       assert(handle:bind('127.0.0.1', 0))
-      assert(handle:recv_start(make_receiver(source)))
+      assert(handle:recv_start(make_receiver(source, handle)))
       handles[source] = handle
       p('new handle', handle:getsockname())
     end
