@@ -31,6 +31,17 @@ kubos-communication-service serial /dev/ttyUSB0 115200
 kubos-communication-service debug-serial 115200 2> debug-log
 ]]
 
+local function makeCallback()
+  local thread = coroutine.running()
+  return function (err, value, ...)
+    if err then
+      assert(coroutine.resume(thread, nil, err))
+    else
+      assert(coroutine.resume(thread, value == nil and true or value, ...))
+    end
+  end
+end
+
 local transport_name = args[1]
 if not transport_name then
   print(usage)
@@ -42,16 +53,15 @@ ffi.cdef[[
   void exit(int status);
 ]]
 
-local function wrap(fn)
+local function wrapper(fn)
   return function (...)
-    local args = {...}
-    return coroutine.wrap(function ()
-      local res, err = xpcall(function ()
+    local args = { ... }
+    return coroutine.wrap(function()
+      local success, result = xpcall(function ()
         return fn(unpack(args))
       end, debug.traceback)
-      if not res then
-        print(err)
-        return ffi.C.exit(-1)
+      if not success then
+        print(result)
       end
     end)()
   end
@@ -63,13 +73,14 @@ local handles = {}
 
 local function make_receiver(dest, handle)
   local pressure = 0
-  return wrap(function (err, data, addr)
+  return wrapper(function (err, data, addr)
     if err then return print(err) end
     if not data then return end
     local source = addr.port
     p('udp-res -> ' .. transport_name, {source=source, dest=dest, len=#data})
     pressure = pressure + 1
-    if pressure > 1 then
+    if pressure == 2 then
+      print("PAUSE CLIENT")
       handle:send('\x01', addr.ip, addr.port)
     end
     write {
@@ -78,7 +89,8 @@ local function make_receiver(dest, handle)
       data = data
     }
     pressure = pressure - 1
-    if pressure == 0 then
+    if pressure == 1 then
+      print("RESUME CLIENT")
       handle:send('\x02', addr.ip, addr.port)
     end
   end)
@@ -86,7 +98,7 @@ end
 
 local function make_sender(dest, handle)
   local pressure = 0
-  return wrap(function (err, data, addr)
+  return wrapper(function (err, data, addr)
     assert(not err, err)
     if not data then return end
     local source = addr.port
@@ -97,6 +109,7 @@ local function make_sender(dest, handle)
     })
     pressure = pressure + 1
     if pressure > 1 then
+      print("Request pause")
       handle:send('\x01', addr.ip, addr.port)
     end
     write {
@@ -105,13 +118,14 @@ local function make_sender(dest, handle)
       data = data,
     }
     pressure = pressure - 1
-    if pressure <= 1 then
+    if pressure == 1 then
+      print("Request resume")
       handle:send('\x02', addr.ip, addr.port)
     end
   end)
 end
 
-wrap(function ()
+wrapper(function ()
   -- Setup the custom transport
   local transport = require('transport-' .. transport_name)
   read, write = transport(unpack(args, 2))
@@ -158,7 +172,8 @@ wrap(function ()
         len = #data,
         checksum = checksum
       })
-      handle:send(data, '127.0.0.1', dest)
+      handle:send(data, '127.0.0.1', dest, makeCallback())
+      coroutine.yield()
     end
   end
 

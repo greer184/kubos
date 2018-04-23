@@ -25,9 +25,44 @@ limitations under the License.
   license = "Apache 2.0"
 ]]
 
+local function makeCallback()
+  local thread = coroutine.running()
+  return function (err, value, ...)
+    if err then
+      assert(coroutine.resume(thread, nil, err))
+    else
+      assert(coroutine.resume(thread, value == nil and true or value, ...))
+    end
+  end
+end
+
+local function wrapper(fn)
+  return function (...)
+    local args = { ... }
+    return coroutine.wrap(function()
+      local success, result = xpcall(function ()
+        return fn(unpack(args))
+      end, debug.traceback)
+      if not success then
+        print(result)
+      end
+    end)()
+  end
+end
+
 local cbor = require 'cbor'
 local defer = require 'defer'
 local byte = string.byte
+local uv = require 'uv'
+
+local function sleep(ms)
+  local timer = uv.new_timer()
+  local co = coroutine.running()
+  timer:start(ms, 0, function ()
+    return coroutine.resume(co)
+  end)
+  return coroutine.yield()
+end
 
 return function (handle, on_message, log_messages)
   local paused = false
@@ -47,27 +82,56 @@ return function (handle, on_message, log_messages)
     end
   end
 
-  local function send_message(message, ...)
+  -- TODO: make key weak reference
+  local handle_waiters = {}
+  local function wait_flush(udp)
+    local co = coroutine.running()
+    local list = handle_waiters[udp]
+    if not list then
+      list = {}
+      handle_waiters[udp] = list
+    end
+    list[#list + 1] = co
+    return coroutine.yield()
+  end
+  local timer = uv.new_timer()
+  timer:start(100, 100, function ()
+    for udp, list in pairs(handle_waiters) do
+      if udp:get_send_queue_count() == 0 then
+        handle_waiters[udp] = nil
+        for i = 1, #list do
+          defer(function ()
+            return coroutine.resume(list[i])
+          end)
+        end
+      end
+    end
+  end)
+
+  local function send_message(message, host, port)
     if paused then
       write_queue[#write_queue + 1] = coroutine.running()
       coroutine.yield()
     end
     if log_messages then p('->', message) end
-    return handle:send('\x00' .. cbor.encode(message), ...)
+    handle:send('\x00' .. cbor.encode(message), host, port, makeCallback())
+    return coroutine.yield()
   end
 
-  local function send_pause(...)
+  local function send_pause(host, port)
     if log_messages then p '-> pause' end
-    return handle:send('\x01', ...)
+    handle:send('\x01', host, port, makeCallback())
+    return coroutine.yield()
   end
 
-  local function send_resume(...)
+  local function send_resume(host, port)
     if log_messages then p '-> resume' end
-    return handle:send('\x02', ...)
+    handle:send('\x02', host, port, makeCallback())
+    return coroutine.yield()
   end
 
-  handle:recv_start(function (err, data, addr)
-    if err then return print(err) end
+  handle:recv_start(wrapper(function (err, data, addr)
+    assert(not err, err)
     if not data then return end
     local control = byte(data, 1)
     if control == 1 then
@@ -83,7 +147,7 @@ return function (handle, on_message, log_messages)
     local message = cbor.decode(data, 2)
     if log_messages then p('<-', message) end
     return on_message(message, addr)
-  end)
+  end))
 
   return send_message, send_pause, send_resume
 end
